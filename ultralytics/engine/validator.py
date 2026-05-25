@@ -177,7 +177,15 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                preds = model(batch["img"], augment=augment)
+                if hasattr(model, "depth_head") and "sparse_depth" in batch:
+                    preds = model(
+                        batch["img"],
+                        augment=augment,
+                        sparse_depth=batch.get("sparse_depth"),
+                        sparse_mask=batch.get("sparse_mask"),
+                    )
+                else:
+                    preds = model(batch["img"], augment=augment)
 
             # Loss
             with dt[2]:

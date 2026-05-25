@@ -4,7 +4,7 @@ from pathlib import Path
 
 from ultralytics.engine.model import Model
 from ultralytics.models import yolo
-from ultralytics.nn.tasks import ClassificationModel, DetectionModel, OBBModel, PoseModel, SegmentationModel, YOLOEModel, YOLOESegModel
+from ultralytics.nn.tasks import ClassificationModel, DetectionModel, OBBModel, PoseModel, SegmentationModel, YOLOEDepthModel, YOLOEModel, YOLOESegModel
 from ultralytics.utils import ROOT, yaml_load
 
 
@@ -85,6 +85,12 @@ class YOLOE(Model):
                 "validator": yolo.yoloe.YOLOEDetectValidator,
                 "predictor": yolo.detect.DetectionPredictor,
                 "trainer": yolo.yoloe.YOLOETrainer,
+            },
+            "depth": {
+                "model": YOLOEDepthModel,
+                "validator": yolo.yoloe.YOLOEDetectValidator,
+                "predictor": yolo.detect.DetectionPredictor,
+                "trainer": yolo.yoloe.YOLOEDepthTrainer,
             },
             "segment": {
                 "model": YOLOESegModel,

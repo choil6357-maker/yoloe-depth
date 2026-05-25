@@ -44,6 +44,7 @@ from ultralytics.nn.modules import (
     Detect,
     DWConv,
     DWConvTranspose2d,
+    FeatureSelect,
     Focus,
     GhostBottleneck,
     GhostConv,
@@ -59,6 +60,8 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     Segment,
+    SPNetDepthHead,
+    TimmBackbone,
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
@@ -772,6 +775,236 @@ class YOLOEModel(DetectionModel):
             return super().init_criterion()
 
 
+class YOLOEDepthLoss:
+    """YOLOE detection loss plus the SPNet depth-completion loss."""
+
+    def __init__(self, model):
+        self.det_criterion = TVPDetectLoss(model) if model.args.load_vp else v8DetectionLoss(model)
+        depth_cfg = model.yaml.get("depth_head", {})
+        self.lambda_depth = float(depth_cfg.get("lambda_depth", 0.1))
+        self.sparse_weight = float(depth_cfg.get("sparse_weight", 1.0))
+        self.loss_type = str(depth_cfg.get("loss_type", "spnet_absolute_relative_gradient"))
+        self.eps = 1e-6
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
+        self.sobel_x = sobel_x
+        self.sobel_y = sobel_y
+
+    def weighted_data_loss(self, output, target, mask):
+        sampled_output = mask * output + (1.0 - mask) * target
+        return torch.abs(sampled_output - target).sum() / (mask.sum() + self.eps)
+
+    def standardize(self, output, target, mask):
+        mask_num = mask.sum(dim=(1, 2, 3), keepdim=True).clamp_min(self.eps)
+        output_mean = (output * mask).sum(dim=(1, 2, 3), keepdim=True) / mask_num
+        target_mean = (target * mask).sum(dim=(1, 2, 3), keepdim=True) / mask_num
+        output_scale = (torch.abs((output - output_mean) * mask).sum(dim=(1, 2, 3), keepdim=True) / mask_num).clamp_min(self.eps)
+        target_scale = (torch.abs((target - target_mean) * mask).sum(dim=(1, 2, 3), keepdim=True) / mask_num).clamp_min(self.eps)
+        return (output - output_mean) / output_scale, (target - target_mean) / target_scale
+
+    def weighted_ms_grad_loss(self, output, target, mask, levels=4):
+        sampled_output = mask * output + (1.0 - mask) * target
+        residual = sampled_output - target
+        total = residual.new_zeros(())
+        weight_x = self.sobel_x.to(device=residual.device, dtype=residual.dtype)
+        weight_y = self.sobel_y.to(device=residual.device, dtype=residual.dtype)
+        for i in range(levels):
+            if i == 0:
+                r = residual
+            else:
+                r = nn.functional.interpolate(residual, scale_factor=1.0 / (2**i), mode="bilinear", align_corners=False, recompute_scale_factor=True)
+            if r.shape[-1] >= 3 and r.shape[-2] >= 3:
+                gx = nn.functional.conv2d(r, weight_x)
+                gy = nn.functional.conv2d(r, weight_y)
+                total = total + torch.abs(gx).sum() + torch.abs(gy).sum()
+        return total / (mask.sum() + self.eps)
+
+    def __call__(self, preds, batch):
+        depth_pred = None
+        if isinstance(preds, tuple) and len(preds) == 2 and torch.is_tensor(preds[1]) and preds[1].ndim == 4:
+            det_preds, depth_pred = preds
+        else:
+            det_preds = preds
+
+        det_loss, det_items = self.det_criterion(det_preds, batch)
+        depth_abs = det_loss.new_zeros(())
+        depth_rel = det_loss.new_zeros(())
+        depth_grad = det_loss.new_zeros(())
+        depth_loss = det_loss.new_zeros(())
+
+        if depth_pred is not None and "dense_depth" in batch:
+            depth_pred_loss = depth_pred.float()
+            dense_depth = batch["dense_depth"].to(device=depth_pred.device, dtype=torch.float32)
+            valid_mask = batch["valid_mask"].to(device=depth_pred.device, dtype=torch.float32)
+            if dense_depth.shape[-2:] != depth_pred.shape[-2:]:
+                dense_depth = nn.functional.interpolate(dense_depth, size=depth_pred.shape[-2:], mode="bilinear", align_corners=False)
+                valid_mask = nn.functional.interpolate(valid_mask, size=depth_pred.shape[-2:], mode="nearest")
+
+            sparse_depth = batch.get("sparse_depth")
+            sparse_mask = batch.get("sparse_mask")
+            if sparse_depth is not None:
+                sparse_depth = sparse_depth.to(device=depth_pred.device, dtype=torch.float32)
+                if sparse_depth.shape[-2:] != depth_pred.shape[-2:]:
+                    sparse_depth = nn.functional.interpolate(sparse_depth, size=depth_pred.shape[-2:], mode="nearest")
+                if sparse_mask is None:
+                    sparse_valid = sparse_depth > 0
+                else:
+                    sparse_mask = sparse_mask.to(device=depth_pred.device, dtype=torch.float32)
+                    if sparse_mask.shape[-2:] != depth_pred.shape[-2:]:
+                        sparse_mask = nn.functional.interpolate(sparse_mask, size=depth_pred.shape[-2:], mode="nearest")
+                    sparse_valid = (sparse_mask > 0.5).to(torch.float32)
+
+                dense_valid = (valid_mask > 0.5).to(torch.float32)
+                if sparse_valid.any():
+                    depth_abs = self.weighted_data_loss(depth_pred_loss, dense_depth, sparse_valid) * self.sparse_weight
+                if dense_valid.any():
+                    sta_depth, sta_gt = self.standardize(depth_pred_loss, dense_depth, dense_valid)
+                    depth_rel = self.weighted_data_loss(sta_depth, sta_gt, dense_valid)
+                    depth_grad = self.weighted_ms_grad_loss(sta_depth, sta_gt, dense_valid)
+                depth_loss = depth_abs + depth_rel + 0.5 * depth_grad
+
+        batch_size = depth_pred.shape[0] if depth_pred is not None else 1
+        total_loss = det_loss + self.lambda_depth * depth_loss * batch_size
+        return total_loss, torch.cat(
+            (
+                det_items,
+                depth_abs.detach().view(1),
+                depth_rel.detach().view(1),
+                depth_grad.detach().view(1),
+                depth_loss.detach().view(1),
+            )
+        )
+
+
+class YOLOEDepthModel(YOLOEModel):
+    """YOLOE model with an auxiliary SPNet-style depth head."""
+
+    def __init__(self, cfg="yoloe_convnextv2_spnet_sample.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        depth_cfg = self.yaml.get("depth_head", {})
+        if not depth_cfg:
+            raise ValueError("YOLOEDepthModel requires a 'depth_head' section in the model YAML.")
+
+        self.depth_from = [int(i) for i in depth_cfg.get("from", [])]
+        channels = depth_cfg.get("channels", [])
+        hidden = int(depth_cfg.get("hidden", 64))
+        self.depth_input_channels = int(depth_cfg.get("input_channels", getattr(self.model[0], "in_chans", ch)))
+        self.depth_head = SPNetDepthHead(
+            channels=channels,
+            hidden=hidden,
+            out_channels=1,
+            variant=depth_cfg.get("variant", "spnet"),
+            sparse_encoder=depth_cfg.get("sparse_encoder", False),
+            feature_adapters=depth_cfg.get("feature_adapters", False),
+            scale_prompt=depth_cfg.get("scale_prompt", False),
+            activation=depth_cfg.get("activation", "silu"),
+            output_activation=depth_cfg.get("output_activation", "identity"),
+        )
+        self.save = sorted(set(self.save).union(self.depth_from))
+
+    def _expand_depth_input(self, image, sparse_depth=None, sparse_mask=None):
+        """Append sparse depth and validity channels when the backbone stem expects them."""
+        first_in_chans = getattr(self.model[0], "in_chans", image.shape[1]) if hasattr(self, "model") else image.shape[1]
+        depth_input_channels = int(getattr(self, "depth_input_channels", first_in_chans))
+        if depth_input_channels <= image.shape[1]:
+            return image
+        needed = depth_input_channels - image.shape[1]
+        if sparse_depth is None:
+            sparse = image.new_zeros((image.shape[0], 1, *image.shape[-2:]))
+        else:
+            sparse = sparse_depth.to(device=image.device, dtype=image.dtype)
+            if sparse.ndim == 3:
+                sparse = sparse.unsqueeze(1)
+            if sparse.shape[-2:] != image.shape[-2:]:
+                sparse = nn.functional.interpolate(sparse, size=image.shape[-2:], mode="nearest")
+        if sparse_mask is None:
+            valid = (sparse > 0).to(image.dtype)
+        else:
+            valid = sparse_mask.to(device=image.device, dtype=image.dtype)
+            if valid.ndim == 3:
+                valid = valid.unsqueeze(1)
+            if valid.shape[-2:] != image.shape[-2:]:
+                valid = nn.functional.interpolate(valid, size=image.shape[-2:], mode="nearest")
+            valid = (valid > 0.5).to(image.dtype)
+        extras = [sparse, valid]
+        while len(extras) < needed:
+            extras.append(image.new_zeros((image.shape[0], 1, *image.shape[-2:])))
+        return torch.cat([image, *extras[:needed]], dim=1)
+
+    def predict(self, x, profile=False, visualize=False, tpe=None, \
+        augment=False, embed=None, vpe=None, return_vpe=False, return_depth=False, sparse_depth=None, sparse_mask=None):
+        """
+        Perform a forward pass. With return_depth=True, also decode dense depth from saved ConvNeXt features.
+        """
+        y, dt, embeddings = [], [], []  # outputs
+        b = x.shape[0]
+        image = x
+        input_hw = x.shape[-2:]
+        x = self._expand_depth_input(x, sparse_depth=sparse_depth, sparse_mask=sparse_mask)
+        for m in self.model:  # except the head part
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            if isinstance(m, C2fAttn):
+                x = m(x, tpe or getattr(self, 'pe', torch.zeros(1, 80, 512)).to(x.device))
+            elif isinstance(m, YOLOEDetect):
+                vpe = m.get_vpe(x, vpe) if vpe is not None else None
+                if return_vpe:
+                    assert(vpe is not None)
+                    assert(not self.training)
+                    return vpe
+                cls_pe = self.get_cls_pe(m.get_tpe(tpe), vpe).to(device=x[0].device, dtype=x[0].dtype)
+                if len(cls_pe) != b:
+                    cls_pe = cls_pe.repeat(b, 1, 1)
+                x = m(x, cls_pe)
+            else:
+                x = m(x)  # run
+
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            if embed and m.i in embed:
+                embeddings.append(nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                if m.i == max(embed):
+                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
+
+        if return_depth:
+            depth_features = [y[i] for i in self.depth_from]
+            self._last_depth_feature_shapes = [tuple(feature.shape) for feature in depth_features]
+            return x, self.depth_head(
+                depth_features,
+                out_shape=input_hw,
+                sparse_depth=sparse_depth,
+                image=image,
+                preserve_sparse=not self.training,
+                sparse_mask=sparse_mask,
+            )
+        return x
+
+    def loss(self, batch, preds=None):
+        """
+        Compute YOLOE detection loss and auxiliary depth loss.
+        """
+        if not hasattr(self, "criterion"):
+            self.criterion = self.init_criterion()
+
+        has_depth_pred = isinstance(preds, tuple) and len(preds) == 2 and torch.is_tensor(preds[1]) and preds[1].ndim == 4
+        if preds is None or ("dense_depth" in batch and not has_depth_pred):
+            preds = self.forward(
+                batch["img"],
+                tpe=batch.get("txt_feats", None),
+                vpe=batch["visuals"] if self.args.load_vp else None,
+                return_depth=True,
+                sparse_depth=batch.get("sparse_depth"),
+                sparse_mask=batch.get("sparse_mask"),
+            )
+        return self.criterion(preds, batch)
+
+    def init_criterion(self):
+        return YOLOEDepthLoss(self)
+
+
 class YOLOESegModel(YOLOEModel, SegmentationModel):
     """YOLOE segmentation model."""
 
@@ -1140,6 +1373,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is TimmBackbone:
+            model_name = args[0] if args else "convnextv2_small"
+            out_indices = args[2] if len(args) > 2 else (1, 2, 3)
+            c2 = m.channels(model_name, out_indices)
+        elif m is FeatureSelect:
+            c2 = ch[f][args[0]]
+            args = [args[0]]
         elif m in {HGStem, HGBlock}:
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
@@ -1233,6 +1473,8 @@ def guess_model_task(model):
 
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
+        if cfg.get("depth_head"):
+            return "depth"
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"

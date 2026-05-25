@@ -46,6 +46,9 @@ class YOLOEValidatorMixin:
         batch = super().preprocess(batch)
         if "visuals" in batch:
             batch["visuals"] = batch["visuals"].to(batch["img"].device)
+        for key in ("dense_depth", "sparse_depth", "sparse_mask", "valid_mask"):
+            if key in batch:
+                batch[key] = batch[key].to(batch["img"].device, non_blocking=True).float()
         return batch
     
     def get_lvis_train_vps_loader(self, model):

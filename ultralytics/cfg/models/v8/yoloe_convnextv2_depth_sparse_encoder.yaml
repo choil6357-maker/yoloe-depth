@@ -1,0 +1,42 @@
+# Parameters
+nc: 80
+depth_multiple: 0.33
+width_multiple: 0.50
+
+depth_head:
+  from: [1, 2, 3, 4]
+  channels: [96, 192, 384, 768]
+  hidden: 64
+  lambda_depth: 1.0
+  sparse_weight: 1.0
+  loss_type: spnet_absolute_relative_gradient
+  output_activation: identity
+  variant: sparse_encoder
+  sparse_encoder: true
+
+backbone:
+  - [-1, 1, TimmBackbone, [convnextv2_small, False, [0, 1, 2, 3]]]
+  - [0, 1, FeatureSelect, [0]]
+  - [0, 1, FeatureSelect, [1]]
+  - [0, 1, FeatureSelect, [2]]
+  - [0, 1, FeatureSelect, [3]]
+  - [-1, 1, SPPF, [1024, 5]]
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 3], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]]
+  - [-1, 3, C2f, [256]]
+
+  - [11, 1, Conv, [256, 3, 2]]
+  - [[-1, 8], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 5], 1, Concat, [1]]
+  - [-1, 3, C2f, [1024]]
+
+  - [[11, 14, 17], 1, YOLOEDetect, [nc, 512, True]]

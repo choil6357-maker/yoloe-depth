@@ -73,6 +73,8 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
+from .backbone import FeatureSelect, TimmBackbone
+from .depth import SPNetDepthHead
 from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, YOLOEDetect, YOLOESegment, v10Detect, LRPCHead
 from .transformer import (
     AIFI,
@@ -159,4 +161,7 @@ __all__ = (
     "C2fCIB",
     "Attention",
     "PSA",
+    "TimmBackbone",
+    "FeatureSelect",
+    "SPNetDepthHead",
 )

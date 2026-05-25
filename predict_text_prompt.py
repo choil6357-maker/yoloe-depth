@@ -1,7 +1,7 @@
 import argparse
 import os
-from PIL import Image
-import supervision as sv
+from pathlib import Path
+import cv2
 from ultralytics import YOLOE
 
 
@@ -11,7 +11,7 @@ def parse_args():
         "--source",
         type=str,
         required=True,
-        help="Path to the input image"
+        help="Path to the input image or video"
     )
     parser.add_argument(
         "--checkpoint",
@@ -28,7 +28,13 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=str,
-        help="Path to save the annotated image"
+        help="Path to save the annotated image (image mode only)"
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.2,
+        help="Confidence threshold for predictions"
     )
     parser.add_argument(
         "--device",
@@ -42,45 +48,40 @@ def parse_args():
 def main():
     args = parse_args()
 
+    model = YOLOE(args.checkpoint)
+    model.to(args.device)
+    model.set_classes(args.names, model.get_text_pe(args.names))
+
+    source_suffix = Path(args.source).suffix.lower()
+    is_video = source_suffix in {
+        ".mp4", ".avi", ".mov", ".mkv", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg"
+    }
+
+    if is_video:
+        results = model.predict(
+            source=args.source,
+            device=args.device,
+            conf=args.conf,
+            save=True,
+            verbose=False,
+        )
+        save_dir = results[0].save_dir if results else "runs/segment/predict"
+        print(f"Annotated video saved under: {save_dir}")
+        return
+
     if not args.output:
         base, ext = os.path.splitext(args.source)
         args.output = f"{base}-output{ext}"
 
-    image = Image.open(args.source).convert("RGB")
-
-    model = YOLOE(args.checkpoint)
-    model.to(args.device)
-
-    model.set_classes(args.names, model.get_text_pe(args.names))
-    results = model.predict(image, verbose=False)
-
-    detections = sv.Detections.from_ultralytics(results[0])
-
-    resolution_wh = image.size
-    thickness = sv.calculate_optimal_line_thickness(resolution_wh=resolution_wh)
-    text_scale = sv.calculate_optimal_text_scale(resolution_wh=resolution_wh)
-
-    labels = [
-        f"{class_name} {confidence:.2f}"
-        for class_name, confidence in zip(detections["class_name"], detections.confidence)
-    ]
-
-    annotated_image = image.copy()
-    annotated_image = sv.MaskAnnotator(
-        color_lookup=sv.ColorLookup.INDEX,
-        opacity=0.4
-    ).annotate(scene=annotated_image, detections=detections)
-    annotated_image = sv.BoxAnnotator(
-        color_lookup=sv.ColorLookup.INDEX,
-        thickness=thickness
-    ).annotate(scene=annotated_image, detections=detections)
-    annotated_image = sv.LabelAnnotator(
-        color_lookup=sv.ColorLookup.INDEX,
-        text_scale=text_scale,
-        smart_position=True
-    ).annotate(scene=annotated_image, detections=detections, labels=labels)
-
-    annotated_image.save(args.output)
+    results = model.predict(
+        source=args.source,
+        device=args.device,
+        conf=args.conf,
+        save=False,
+        verbose=False,
+    )
+    annotated = results[0].plot()
+    cv2.imwrite(args.output, annotated)
     print(f"Annotated image saved to: {args.output}")
 
 if __name__ == "__main__":
