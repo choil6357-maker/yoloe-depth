@@ -173,3 +173,10 @@ calibration_*.npy
 ignore
 exports
 pretrain
+
+
+third_party/SPNet/
+third_party/ml-depth-pro/
+third_party/Depth-Anything-V2/
+samples/
+tiny_video100/
